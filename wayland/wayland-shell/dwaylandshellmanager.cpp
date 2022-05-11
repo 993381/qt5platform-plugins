@@ -116,52 +116,41 @@ inline static wl_surface *getWindowWLSurface(QWaylandWindow *window)
 
 static PlasmaShellSurface* createKWayland(QWaylandWindow *window)
 {
-    if (!window)
+    if (!window || !kwayland_shell)
         return nullptr;
 
-    if (kwayland_shell) {
-        auto surface = window->shellSurface();
-        return kwayland_shell->createSurface(getWindowWLSurface(window), surface);
-    }
-
-    return nullptr;
+    auto surface = window->shellSurface();
+    return kwayland_shell->createSurface(getWindowWLSurface(window), surface);
 }
 
 static PlasmaShellSurface *ensureKWaylandSurface(QWaylandShellSurface *self)
 {
-    auto *ksurface = self->findChild<PlasmaShellSurface*>();
-
-    if (!ksurface) {
-        ksurface = createKWayland(self->window());
+    if (auto *ksurface = self->findChild<PlasmaShellSurface*>()) {
+        return ksurface;
     }
 
-    return ksurface;
+    return createKWayland(self->window());
 }
 
 static DDEShellSurface* createDDESurface(QWaylandWindow *window)
 {
-    if (!window)
+    if (!window || !ddeShell)
         return nullptr;
 
-    if (ddeShell) {
-        auto surface = window->shellSurface();
-        return ddeShell->createShellSurface(getWindowWLSurface(window), surface);
-    }
-
-    return nullptr;
+    auto surface = window->shellSurface();
+    return ddeShell->createShellSurface(getWindowWLSurface(window), surface);
 }
 
 static DDEShellSurface *ensureDDEShellSurface(QWaylandShellSurface *self)
 {
     if (!self)
         return nullptr;
-    auto *dde_shell_surface = self->findChild<DDEShellSurface*>();
 
-    if (!dde_shell_surface) {
-        dde_shell_surface = createDDESurface(self->window());
+    if (auto *shell_surface = self->findChild<DDEShellSurface*>()) {
+        return shell_surface;
     }
 
-    return dde_shell_surface;
+    return createDDESurface(self->window());
 }
 
 DWaylandShellManager::DWaylandShellManager()
@@ -178,26 +167,30 @@ DWaylandShellManager::~DWaylandShellManager()
 void DWaylandShellManager::sendProperty(QWaylandShellSurface *self, const QString &name, const QVariant &value)
 {
     // 某些应用程序(比如日历，启动器)调用此方法时 self为空，导致插件崩溃
-    if(!self) {
+    if (Q_UNLIKELY(!self)) {
         return;
     }
 
-    if (!CHECK_PREFIX(name))
-        return HookCall(self, &QWaylandShellSurface::sendProperty, name, value);
+    if (Q_UNLIKELY(!CHECK_PREFIX(name))) {
+        HookCall(self, &QWaylandShellSurface::sendProperty, name, value);
+        return;
+    }
 
-    auto *ksurface = ensureKWaylandSurface(self);
+    QWaylandWindow *wlWindow = self->window();
+    if (Q_UNLIKELY(!wlWindow)) {
+        qCWarning(dwlp) << "Error, wlWindow is nullptr";
+        return;
+    }
+
     // 如果创建失败则说明kwaylnd_shell对象还未初始化，应当终止设置
     // 记录下本次的设置行为，kwayland_shell创建后会重新设置这些属性
-    if (!ksurface) {
-        QWaylandWindow * qw = self->window();
-        if (qw) {
-            send_property_window_list << self->window();
-        }
+    auto *ksurface = ensureKWaylandSurface(self);
+    if (Q_UNLIKELY(!ksurface)) {
+        send_property_window_list << wlWindow;
         return;
     }
 
-    auto *dde_shell_surface = ensureDDEShellSurface(self);
-    if (dde_shell_surface) {
+    if (auto *dde_shell_surface = ensureDDEShellSurface(self)) {
         if (!name.compare(noTitlebar)) {
             qCDebug(dwlp()) << "### requestNoTitleBar" << value;
             dde_shell_surface->requestNoTitleBarProperty(value.toBool());
@@ -205,12 +198,12 @@ void DWaylandShellManager::sendProperty(QWaylandShellSurface *self, const QStrin
         if (!name.compare(windowRadius)) {
             bool ok = false;
             qreal radius  = value.toInt(&ok);
-            if (self->window() && self->window()->screen())
-                radius *= self->window()->screen()->devicePixelRatio();
+            if (wlWindow->screen())
+                radius *= wlWindow->screen()->devicePixelRatio();
             qCDebug(dwlp()) << "### requestWindowRadius" << radius << value;
             if (ok)
                 dde_shell_surface->requestWindowRadiusProperty({radius, radius});
-             else
+            else
                 qCWarning(dwlp) << "invalid property" << name << value;
         }
         if (!name.compare(splitWindowOnScreen)) {
@@ -223,24 +216,17 @@ void DWaylandShellManager::sendProperty(QWaylandShellSurface *self, const QStrin
             } else {
                 qCWarning(dwlp) << "invalid property: " << name << value;
             }
-            self->window()->window()->setProperty(splitWindowOnScreen, 0);
+            wlWindow->window()->setProperty(splitWindowOnScreen, 0);
         }
         if (!name.compare(supportForSplittingWindow)) {
-            if (self->window() && self->window()->window()) {
-                self->window()->window()->setProperty(supportForSplittingWindow, dde_shell_surface->isSplitable());
-            }
+            wlWindow->window()->setProperty(supportForSplittingWindow, dde_shell_surface->isSplitable());
             return;
         }
     }
 
     // 将popup的窗口设置为tooltop层级, 包括qmenu，combobox弹出窗口
-    {
-        QWaylandWindow *wayland_window = self->window();
-        if (wayland_window) {
-            if (wayland_window->window()->type() == Qt::Popup)
-                ksurface->setRole(PlasmaShellSurface::Role::ToolTip);
-        }
-    }
+    if (wlWindow->window()->type() == Qt::Popup)
+        ksurface->setRole(PlasmaShellSurface::Role::ToolTip);
 
 #ifdef D_DEEPIN_KWIN
     // 禁止窗口移动接口适配。
@@ -251,7 +237,7 @@ void DWaylandShellManager::sendProperty(QWaylandShellSurface *self, const QStrin
     }
 
     if (QStringLiteral(_DWAYALND_ "global_keyevent") == name && value.toBool()) {
-        current_window = self->window();
+        current_window = wlWindow;
         // 只有关心全局键盘事件才连接, 并且随窗口销毁而断开
         QObject::connect(kwayland_dde_keyboard, &DDEKeyboard::keyChanged,
                          current_window, &DWaylandShellManager::handleKeyEvent,
@@ -259,49 +245,43 @@ void DWaylandShellManager::sendProperty(QWaylandShellSurface *self, const QStrin
         QObject::connect(kwayland_dde_keyboard, &DDEKeyboard::modifiersChanged,
                          current_window, &DWaylandShellManager::handleModifiersChanged,
                          Qt::ConnectionType::UniqueConnection);
-
     }
-
 #endif
 
     if (QStringLiteral(_DWAYALND_ "dockstrut") == name) {
         setDockStrut(self, value);
     }
-
     if (QStringLiteral(_DWAYALND_ "window-position") == name) {
-        QWaylandWindow *wayland_window = self->window();
-        if (!wayland_window) {
-            return;
-        }
         ksurface->setPosition(value.toPoint());
-    } else if (QStringLiteral(_DWAYALND_ "window-type") == name) {
+    }
+    static const QMap<PlasmaShellSurface::Role, QStringList> role2type = {
+        {PlasmaShellSurface::Role::Normal, {"normal"}},
+        {PlasmaShellSurface::Role::Desktop, {"desktop"}},
+        {PlasmaShellSurface::Role::Panel, {"dock", "panel"}},
+        {PlasmaShellSurface::Role::OnScreenDisplay, {"wallpaper", "onScreenDisplay"}},
+        {PlasmaShellSurface::Role::Notification, {"notification"}},
+        {PlasmaShellSurface::Role::ToolTip, {"tooltip"}},
+    #ifdef D_DEEPIN_KWIN
+        {PlasmaShellSurface::Role::StandAlone, {"launcher", "standAlone"}},
+        {PlasmaShellSurface::Role::Override, {"session-shell", "menu", "wallpaper-set", "override"}},
+    #endif
+    };
+
+    if (QStringLiteral(_DWAYALND_ "window-type") == name) {
+        // 根据 type 设置对应的 role
         const QByteArray &type = value.toByteArray();
-
-        if (type == "normal") {
-            ksurface->setRole(PlasmaShellSurface::Role::Normal);
-        } else if (type == "desktop") {
-            ksurface->setRole(PlasmaShellSurface::Role::Desktop);
-        }else if (type == "dock" || type == "panel") {
-            ksurface->setRole(PlasmaShellSurface::Role::Panel);
-            ksurface->setPanelBehavior(PlasmaShellSurface::PanelBehavior::AlwaysVisible);
-        } else if (type == "wallpaper" || type == "onScreenDisplay") {
-            ksurface->setRole(PlasmaShellSurface::Role::OnScreenDisplay);
-        } else if (type == "notification") {
-            ksurface->setRole(PlasmaShellSurface::Role::Notification);
-        } else if (type == "tooltip") {
-            ksurface->setRole(PlasmaShellSurface::Role::ToolTip);
-        } else if (type == "launcher" || type == "standAlone") {
-#ifdef D_DEEPIN_KWIN
-            ksurface->setRole(PlasmaShellSurface::Role::StandAlone);
-#endif
-        } else if (type == "session-shell" || type == "menu" || type == "wallpaper-set" || type == "override") {
-#ifdef D_DEEPIN_KWIN
-            ksurface->setRole(PlasmaShellSurface::Role::Override);
-#endif
-        } else {
-
+        for (int i = 0; i <= (int)PlasmaShellSurface::Role::ActiveFullScreen; ++i) {
+            PlasmaShellSurface::Role role = PlasmaShellSurface::Role(i);
+            if (role2type.value(role).contains(type)) {
+                ksurface->setRole(role);
+                if (type == "dock" || type == "panel") {
+                    ksurface->setPanelBehavior(PlasmaShellSurface::PanelBehavior::AlwaysVisible);
+                }
+                break;
+            }
         }
-    } else if (QStringLiteral(_DWAYALND_ "staysontop") == name) {
+    }
+    if (QStringLiteral(_DWAYALND_ "staysontop") == name) {
         setWindowStaysOnTop(self, value.toBool());
     }
 }
@@ -585,9 +565,9 @@ void DWaylandShellManager::requestActivateWindow(QPlatformWindow *self)
     VtableHook::originalFun(self, &QPlatformWindow::requestActivateWindow);
 
     if (!self->QPlatformWindow::parent() && ddeShell) {
-        auto qwayland_window = static_cast<QWaylandWindow *>(self);
-        if (qwayland_window) {
-            QWaylandShellSurface *q_shell_surface = qwayland_window->shellSurface();
+        auto qwlWindow = static_cast<QWaylandWindow *>(self);
+        if (qwlWindow) {
+            QWaylandShellSurface *q_shell_surface = qwlWindow->shellSurface();
             auto *dde_shell_surface = ensureDDEShellSurface(q_shell_surface);
             if (dde_shell_surface) {
                 dde_shell_surface->requestActive();
