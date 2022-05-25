@@ -8,6 +8,8 @@
 
 #include <QtWaylandClientVersion>
 #include <QLoggingCategory>
+#include <private/qhighdpiscaling_p.h>
+#include <QTimer>
 
 #ifndef QT_DEBUG
 Q_LOGGING_CATEGORY(dwlp, "dtk.wayland.plugin" , QtInfoMsg);
@@ -92,7 +94,17 @@ static DDEShellSurface *ensureDDEShellSurface(QWaylandShellSurface *self)
 DWaylandShellManager::DWaylandShellManager()
     : m_registry (new Registry())
 {
-
+    QObject::connect(m_registry, &Registry::registryDestroyed, []{
+        delete kwayland_shell         ; kwayland_shell          = nullptr;
+        delete kwayland_ssd           ; kwayland_ssd            = nullptr;
+        delete ddeShell               ; ddeShell                = nullptr;
+        delete kwayland_strut         ; kwayland_strut          = nullptr;
+        delete kwayland_dde_seat      ; kwayland_dde_seat       = nullptr;
+        delete kwayland_dde_touch     ; kwayland_dde_touch      = nullptr;
+        delete kwayland_dde_pointer   ; kwayland_dde_pointer    = nullptr;
+        delete kwayland_dde_fake_input; kwayland_dde_fake_input = nullptr;
+        delete kwayland_dde_keyboard  ; kwayland_dde_keyboard   = nullptr;
+    });
 }
 
 DWaylandShellManager::~DWaylandShellManager()
@@ -482,11 +494,77 @@ void DWaylandShellManager::handleGeometryChange(QWaylandWindow *window)
     if (!ddeShellSurface) {
         return;
     }
+    static bool isSceenChanged = false;
     QObject::connect(ddeShellSurface, &DDEShellSurface::geometryChanged,
                      [=] (const QRect &geom) {
+        if (isSceenChanged) {
+            qInfo() << "geometryChanged ...................... return";
+            return;
+        }
+        qInfo() << "geometryChanged ...................... " << geom;
         QRect newRect(geom.topLeft(), window->geometry().size());
         QWindowSystemInterface::handleGeometryChange(window->window(), newRect);
     });
+
+    QObject::connect(qApp, &QGuiApplication::screenRemoved, [window](QScreen *screen){
+        qInfo() << "====================================== screenRemoved";
+        // 一秒内的多次触发只响应一次
+        if (isSceenChanged) {
+            return;
+        } else {
+            isSceenChanged = true;
+            QTimer::singleShot(1000, [window]{
+                if (isSceenChanged) {
+                    QHighDpiScaling::updateHighDpiScaling();
+                    for (auto sc : qApp->screens()) {
+                        if (window->window()->screen()->name() == sc->name()) {
+                            QWindowSystemInterface::handleScreenLogicalDotsPerInchChange(sc, window->screen()->logicalDpi().first, window->screen()->logicalDpi().second);
+                            QWindowSystemInterface::handleScreenGeometryChange(window->screen()->screen(), sc->geometry(), sc->availableGeometry());
+                        }
+                    }
+                    isSceenChanged = false;
+                    qInfo() << "====================================== screenRemoved done";
+                }
+            });
+        }
+    });
+#if 1
+    QObject::connect(qApp, &QGuiApplication::screenAdded, [window](QScreen *screen){
+        qInfo() << "====================================== screenAdded";
+        if (isSceenChanged) {
+            return;
+        } else {
+            isSceenChanged = true;
+            QTimer::singleShot(1000, [=]{
+                if (isSceenChanged) {
+                    QHighDpiScaling::updateHighDpiScaling();
+
+                    qInfo() << "====================================== screenAdded done";
+                    for (auto sc : qApp->screens()) {
+                        if (window->window()->screen()->name() == sc->name()) {
+                            QWindowSystemInterface::handleScreenLogicalDotsPerInchChange(screen, window->screen()->logicalDpi().first, window->screen()->logicalDpi().second);
+                            QWindowSystemInterface::handleScreenGeometryChange(sc, screen->geometry(), screen->availableGeometry());
+                        }
+                    }
+                    isSceenChanged = false;
+                }
+            });
+        }
+        // 找到应用窗口所在的屏幕，用平台屏幕的信息更新qApp内的屏幕
+        // QTimer::singleShot(1, [window, screen]{
+        //     for (auto sc : qApp->screens()) {
+        //         if (window->window()->screen()->name() == sc->name()) {
+        //             qInfo() << "======================================1: " << sc->availableGeometry();
+        //             // QHighDpiScaling::updateHighDpiScaling();
+        //             qInfo() << "======================================2: " << sc->availableGeometry();
+        //             QWindowSystemInterface::handleScreenLogicalDotsPerInchChange(screen, window->screen()->logicalDpi().first, window->screen()->logicalDpi().second);
+        //             QWindowSystemInterface::handleScreenGeometryChange(sc, screen->geometry(), screen->availableGeometry());
+        //         }
+        //     }
+        // });
+        return;
+    });
+#endif
 }
 
 typedef DDEShellSurface KCDFace;
